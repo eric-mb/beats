@@ -7,12 +7,12 @@ import argparse
 import librosa
 from pathlib import Path
 from typing import Dict, Any, Tuple
+import os
+import subprocess
 
-sys.path.append("unilm/beats/")
-from BEATs import BEATs, BEATsConfig
+from beats.BEATs import BEATs, BEATsConfig
 
 sys.path.append(".")
-from project_utils import set_seeds, setup_logging
 
 
 def parse_args():
@@ -30,12 +30,21 @@ def parse_args():
     parser.add_argument(
         "-o", "--pkl_dir", type=str, required=True, help="Path to pkl directory"
     )
+    parser.add_argument("--workers", type=int, default=4, help="Number of workers")
+    parser.add_argument("--rewrite", action="store_true", help="Force rewrite")
+    parser.add_argument("--debug", action="store_true", help="Debugging outputs")
     return parser.parse_args()
 
 
-def get_models(device: str, script_dir: Path) -> Tuple[BEATs, Dict[int, str]]:
+def get_models(device: str) -> Tuple[BEATs, Dict[int, str]]:
     checkpoint = torch.load(
-        script_dir / "pretrained_utils/BEATs_iter3_plus_AS2M_finetuned_on_AS2M_cpt2.pt"
+        Path(
+            os.path.join(
+                "beats",
+                "checkpoints",
+                "BEATs_iter3_plus_AS2M_finetuned_on_AS2M_cpt2.pt",
+            )
+        )
     )
     cfg = BEATsConfig(checkpoint["cfg"])
     BEATs_model = BEATs(cfg)
@@ -43,7 +52,7 @@ def get_models(device: str, script_dir: Path) -> Tuple[BEATs, Dict[int, str]]:
     BEATs_model.to(device)
     BEATs_model.eval()
 
-    with open(script_dir / "pretrained_utils/ontology.json", "r") as f:
+    with open(os.path.join("beats", "checkpoints", "ontology.json"), "r") as f:
         data = json.load(f)
 
     idx_to_code = {v: k for k, v in checkpoint["label_dict"].items()}
@@ -52,14 +61,46 @@ def get_models(device: str, script_dir: Path) -> Tuple[BEATs, Dict[int, str]]:
     for entry in data:
         if entry["id"] in idx_to_code:
             label_map[idx_to_code[entry["id"]]] = entry["name"]
+            if entry["name"] == "Music":
+                music_id = idx_to_code[entry["id"]]
 
-    return BEATs_model, label_map
+    return BEATs_model, label_map, music_id
+
+
+def extract_audio(video_path: Path, output_path: Path, num_workers: int) -> bool:
+
+    command = [
+        "ffmpeg",
+        "-y",
+        "-i",
+        str(video_path),
+        "-qscale:a",
+        "0",
+        "-ac",
+        "1",
+        "-vn",
+        "-threads",
+        str(num_workers),
+        "-ar",
+        "16000",
+        str(output_path),
+        "-loglevel",
+        "panic",
+    ]
+
+    try:
+        subprocess.run(command, check=True, capture_output=True, text=True)
+        return True
+    except subprocess.CalledProcessError as e:
+        logging.error(f"Failed to extract audio from {video_path}: {e}")
+        return False
 
 
 def process_video(
     audio_path: Path,
     beats_model: BEATs,
     label_map: Dict[int, str],
+    music_id: int,
     device: str,
 ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     """
@@ -87,8 +128,7 @@ def process_video(
     for i, chunk in enumerate(chunks):
         start_time, end_time = i * 10, (i + 1) * 10
 
-        audio_array, _ = chunk
-        audio_array = torch.tensor(audio_array).unsqueeze(0).to(torch.float32)
+        audio_array = torch.tensor(chunk).unsqueeze(0).to(torch.float32)
 
         if audio_array.shape[1] < required_sr:
             audio_array = torch.nn.functional.pad(
@@ -106,21 +146,21 @@ def process_video(
                 audio_array, padding_mask=padding_mask
             )[0]
 
-        top3_label_probs = []
-        for i, (top3_label_prob, top3_label_idx) in enumerate(zip(*probs.topk(k=3))):
-            top3_label_probs.append(
-                (
-                    [label_map[label_idx.item()] for label_idx in top3_label_idx],
-                    top3_label_prob.tolist(),
-                )
-            )
+        predicted_labels = []
+        for idx, entry in enumerate(probs.tolist()[0]):
+            if entry > 0.3:
+                predicted_labels.append(label_map[idx])
 
+        top3_prob, top3_idx = probs.topk(k=3)
+        top3_labels = [label_map[label_idx] for label_idx in top3_idx.tolist()[0]]
         predictions.append(
             {
                 "start": start_time,
                 "end": end_time,
-                "top3_label": [l for l, _ in top3_label_probs],
-                "top3_label_prob": [p for _, p in top3_label_probs],
+                "top3_label": top3_labels,
+                "top3_label_prob": top3_prob.tolist()[0],
+                "predicted_labels": predicted_labels,
+                "music_prob": probs.tolist()[0][music_id],
             }
         )
 
@@ -128,27 +168,50 @@ def process_video(
 
 
 def main():
-    script_path = Path(__file__).resolve()
-    log_file = setup_logging("audio_classification")
-
     args = parse_args()
 
-    logging.info(f"Log file will be saved at: {log_file}")
-    set_seeds(42)
+    # define logging level and format
+    level = logging.INFO
+    if args.debug:
+        level = logging.DEBUG
+    logging.basicConfig(
+        format="%(asctime)s %(levelname)s:%(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+        level=level,
+    )
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    beats_model, label_map = get_models(device, script_path.parent)
+    beats_model, label_map, music_id = get_models(device)
 
+    # loop trough input videos
     for video in args.videos:
+        # setup paths
         video_path = Path(video)
-        audio_path = Path(args.pkl_dir) / "audio.wav"
+        audio_path = Path(args.pkl_dir) / video_path.stem / "audio.wav"
         output_path = Path(args.pkl_dir) / video_path.stem / "audioClf.pkl"
-        output_path.mkdir(parents=True, exist_ok=True)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
 
-        audio_cls = process_video(
-            audio_path, video_path, beats_model, label_map, device
-        )
+        # check if audio file exists
+        audio = True
+        if not os.path.isfile(audio_path) or args.rewrite:
+            # if not, create audio file
+            logging.info(f"Extract audio for {video}")
+            audio = extract_audio(
+                video_path=video_path,
+                output_path=audio_path,
+                num_workers=args.workers,
+            )
 
+        # audio could not be loaded or extracted
+        if not audio:
+            logging.error(f"{audio_path} does not exist")
+            continue
+
+        # perform audio classification
+        logging.info(f"Perform audio classification for {video}")
+        audio_cls = process_video(audio_path, beats_model, label_map, music_id, device)
+
+        # write output dict to pkl
         output_dict = {
             "github_repo": "https://github.com/microsoft/unilm",
             "commit_id": "13641268b59df5cf90d27b451d87ab58b6a07055",
@@ -157,10 +220,10 @@ def main():
             "output_data": audio_cls,
         }
 
-        with open(output_path, "wb") as f:
+        with open(str(output_path), "wb") as f:
             pickle.dump(output_dict, f)
 
-        logging.info(f"Saved shot audio classification to: {output_path}")
+        logging.info(f"Saved audio classification to: {str(output_path)}")
 
 
 if __name__ == "__main__":
